@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Free 3‑Photo Fit Board (Front / Side / Back)</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; margin: 24px; background:#f6f7fb; color:#111; }
+    h1 { margin: 0 0 8px; }
+    .app { max-width: 980px; margin: 0 auto; background:#fff; border-radius: 16px; box-shadow: 0 6px 24px rgba(0,0,0,.08); padding: 20px; }
+    .grid { display:grid; grid-template-columns: 1fr; gap:16px; }
+    @media(min-width:780px){ .grid{ grid-template-columns: repeat(3, 1fr);} }
+    .card { background:#fafbff; border:1px solid #e7e9f3; border-radius:12px; padding:14px; }
+    label { font-weight: 600; font-size: 14px; display:block; margin-bottom:8px; }
+    input[type="file"] { width:100%; padding:10px; border:1px dashed #cdd2e2; border-radius:10px; background:#fff; }
+    button { cursor:pointer; border:0; background:#111; color:#fff; padding:12px 16px; border-radius:12px; font-weight:700; }
+    button.secondary { background:#fff; color:#111; border:1px solid #d0d5e7; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    canvas { width:100%; max-width:100%; background:#fff; border-radius:12px; border:1px solid #e7e9f3; }
+    small.mono { font-family: ui-monospace, Menlo, Consolas, monospace; color:#6b7280; }
+  </style>
+  <!-- TensorFlow.js + BodyPix (runs fully in the browser) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.0"></script>
+</head>
+<body>
+  <div class="app">
+    <h1>Free 3‑Photo Fit Board</h1>
+    <p>Upload <b>Front</b>, <b>Side</b>, and <b>Back</b> photos. This page will <b>auto‑segment</b> the person, <b>crop</b> to the silhouette, and <b>compose</b> a board labeled FRONT / SIDE / BACK — all locally in your browser.</p>
+
+    <div class="grid">
+      <div class="card"><label>Front</label><input id="front" type="file" accept="image/*" /></div>
+      <div class="card"><label>Side</label><input id="side" type="file" accept="image/*" /></div>
+      <div class="card"><label>Back</label><input id="back" type="file" accept="image/*" /></div>
+    </div>
+
+    <div style="height:12px"></div>
+    <div class="row">
+      <button id="build">Build Layout</button>
+      <button id="download" class="secondary">Download PNG</button>
+      <small class="mono">Everything runs on‑device. No uploads.</small>
+    </div>
+
+    <div style="height:12px"></div>
+    <canvas id="output" width="1500" height="850" aria-label="Final layout canvas"></canvas>
+
+    <p><small class="mono">Tip: for best results, use full‑body photos against a clean background. If segmentation fails, the tool will fall back to a centered smart crop.</small></p>
+  </div>
+
+<script>
+(async function(){
+  const fileInputs = {
+    front: document.getElementById('front'),
+    side:  document.getElementById('side'),
+    back:  document.getElementById('back')
+  };
+
+  const buildBtn = document.getElementById('build');
+  const dlBtn = document.getElementById('download');
+  const out = document.getElementById('output');
+  const ctx = out.getContext('2d');
+
+  // Style constants for the board
+  const PAD = 28, GAP = 16;
+  const COLS = 3;
+  const TOP_BANNER = 80; // space for the FRONT/SIDE/BACK words
+  const cellW = Math.floor((out.width - PAD*2 - GAP*(COLS-1)) / COLS);
+  const cellH = out.height - PAD*2 - TOP_BANNER;
+
+  // Load BodyPix once
+  const net = await bodyPix.load({ architecture: 'MobileNetV1', outputStride: 16, multiplier: 0.75, quantBytes: 2 });
+
+  function loadImage(file){
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = reject;
+      img.src = url;
+    });
+  }
+
+  function getBoundingBoxFromMask(mask, width, height){
+    // mask is a Uint8ClampedArray RGBA returned from toMask OR boolean array from segmentation.data
+    let top = height, left = width, right = 0, bottom = 0;
+    let found = false;
+
+    // If mask is boolean array (segmentation.data)
+    if (mask instanceof Uint8Array || mask instanceof Uint8ClampedArray){
+      // Assume RGBA, keep non‑transparent pixels
+      for(let y=0, i=0; y<height; y++){
+        for(let x=0; x<width; x++, i+=4){
+          const a = mask[i+3];
+          if (a > 0){
+            found = true;
+            if (x < left) left = x;
+            if (x > right) right = x;
+            if (y < top) top = y;
+            if (y > bottom) bottom = y;
+          }
+        }
+      }
+    } else {
+      // boolean array from segmentation
+      for(let y=0, i=0; y<height; y++){
+        for(let x=0; x<width; x++, i++){
+          if (mask[i]){
+            found = true;
+            if (x < left) left = x;
+            if (x > right) right = x;
+            if (y < top) top = y;
+            if (y > bottom) bottom = y;
+          }
+        }
+      }
+    }
+
+    if (!found) return null;
+
+    // add a little breathing room
+    const margin = 18;
+    left = Math.max(0, left - margin);
+    top = Math.max(0, top - margin);
+    right = Math.min(width-1, right + margin);
+    bottom = Math.min(height-1, bottom + margin);
+
+    return { x:left, y:top, w:(right-left+1), h:(bottom-top+1) };
+  }
+
+  async function segmentAndCrop(img){
+    // Draw image to a temp canvas at a manageable size (speed/quality tradeoff)
+    const maxSide = 900;
+    const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+    const w = Math.round(img.width * scale);
+    const h = Math.round(img.height * scale);
+
+    const temp = document.createElement('canvas');
+    temp.width = w; temp.height = h;
+    const tctx = temp.getContext('2d');
+    tctx.drawImage(img, 0, 0, w, h);
+
+    // Person segmentation
+    const segmentation = await net.segmentPerson(temp, {
+      internalResolution: 'medium', // 'low'|'medium'|'high'
+      segmentationThreshold: 0.7,
+    });
+
+    // Convert to an RGBA mask we can trim by
+    const fg = { r: 0, g: 0, b: 0, a: 0 };
+    const bg = { r: 0, g: 0, b: 0, a: 0 };
+    const mask = bodyPix.toMask(segmentation, fg, bg, true); // person = opaque white, background = transparent
+
+    // Find bounding box of the opaque area
+    const box = getBoundingBoxFromMask(mask.data, mask.width, mask.height);
+
+    // If no person found, fall back to centered crop
+    const fallback = !box ? { x: Math.max(0, (w - Math.min(w,h))/2), y: Math.max(0, (h - Math.min(w,h))/2), w: Math.min(w,h), h: Math.min(w,h) } : box;
+
+    // Create a masked, trimmed canvas
+    const outC = document.createElement('canvas');
+    outC.width = fallback.w; outC.height = fallback.h;
+    const octx = outC.getContext('2d');
+
+    // Paint masked image
+    octx.save();
+    // Use the mask alpha to clip drawing
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = mask.width; maskCanvas.height = mask.height;
+    const mctx = maskCanvas.getContext('2d');
+    const mimg = new ImageData(mask.data, mask.width, mask.height);
+    mctx.putImageData(mimg, 0, 0);
+
+    // Draw mask portion
+    octx.drawImage(maskCanvas, fallback.x, fallback.y, fallback.w, fallback.h, 0, 0, fallback.w, fallback.h);
+    octx.globalCompositeOperation = 'source-in';
+    octx.drawImage(temp, fallback.x, fallback.y, fallback.w, fallback.h, 0, 0, fallback.w, fallback.h);
+    octx.restore();
+
+    return outC; // returns a trimmed, masked person crop
+  }
+
+  function placeLabeled(context, x, y, w, h, label){
+    context.save();
+    context.fillStyle = '#fff';
+    context.fillRect(x, y, w, h + TOP_BANNER);
+
+    // Label
+    context.fillStyle = '#111';
+    context.font = 'bold 40px Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillText(label, x + w/2, y + 24);
+    context.restore();
+  }
+
+  async function build(){
+    const files = [fileInputs.front.files[0], fileInputs.side.files[0], fileInputs.back.files[0]];
+    if (!files.every(Boolean)) {
+      alert('Please select all three photos (Front, Side, Back).');
+      return;
+    }
+
+    // Clear board
+    ctx.clearRect(0,0,out.width,out.height);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0,0,out.width,out.height);
+
+    const labels = ['FRONT', 'SIDE', 'BACK'];
+
+    for (let i=0; i<3; i++){
+      const img = await loadImage(files[i]);
+      const trimmed = await segmentAndCrop(img);
+
+      // Place column area
+      const x = PAD + i * (cellW + GAP);
+      const y = PAD;
+      placeLabeled(ctx, x, y, cellW, cellH, labels[i]);
+
+      // Fit the trimmed person into the cell area below the banner
+      const usableH = cellH - 40; // minus some top space under the word
+      const targetW = cellW - 24; // side padding
+      const targetH = usableH - 24; // bottom padding
+      const scale = Math.min(targetW / trimmed.width, targetH / trimmed.height);
+      const drawW = Math.round(trimmed.width * scale);
+      const drawH = Math.round(trimmed.height * scale);
+      const dx = x + (cellW - drawW)/2;
+      const dy = y + 40 + (usableH - drawH)/2;
+
+      ctx.save();
+      // Soft drop shadow for legibility
+      ctx.shadowColor = 'rgba(0,0,0,0.14)';
+      ctx.shadowBlur = 14; ctx.shadowOffsetY = 6;
+      ctx.drawImage(trimmed, dx, dy, drawW, drawH);
+      ctx.restore();
+    }
+  }
+
+  buildBtn.addEventListener('click', () => build());
+
+  dlBtn.addEventListener('click', () => {
+    const url = out.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'fit-board-front-side-back.png';
+    a.click();
+  });
+})();
+</script>
+</body>
+</html>
