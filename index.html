@@ -5,9 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Free 3‑Photo Fit Board (Front / Side / Back)</title>
   <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; margin: 24px; background:#f6f7fb; color:#111; }
+    :root { --pad:28px; --gap:16px; --banner:80px; }
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+           margin: 24px; background:#f6f7fb; color:#111; }
     h1 { margin: 0 0 8px; }
-    .app { max-width: 980px; margin: 0 auto; background:#fff; border-radius: 16px; box-shadow: 0 6px 24px rgba(0,0,0,.08); padding: 20px; }
+    .app { max-width: 980px; margin: 0 auto; background:#fff; border-radius: 16px;
+           box-shadow: 0 6px 24px rgba(0,0,0,.08); padding: 20px; }
     .grid { display:grid; grid-template-columns: 1fr; gap:16px; }
     @media(min-width:780px){ .grid{ grid-template-columns: repeat(3, 1fr);} }
     .card { background:#fafbff; border:1px solid #e7e9f3; border-radius:12px; padding:14px; }
@@ -44,7 +47,7 @@
     <div style="height:12px"></div>
     <canvas id="output" width="1500" height="850" aria-label="Final layout canvas"></canvas>
 
-    <p><small class="mono">Tip: for best results, use full‑body photos against a clean background. If segmentation fails, the tool will fall back to a centered smart crop.</small></p>
+    <p><small class="mono">Tip: for best results, use full‑body photos against a clean background. If segmentation fails, the tool falls back to a smart centered crop.</small></p>
   </div>
 
 <script>
@@ -60,15 +63,20 @@
   const out = document.getElementById('output');
   const ctx = out.getContext('2d');
 
-  // Style constants for the board
+  // Board layout constants
   const PAD = 28, GAP = 16;
   const COLS = 3;
   const TOP_BANNER = 80; // space for the FRONT/SIDE/BACK words
   const cellW = Math.floor((out.width - PAD*2 - GAP*(COLS-1)) / COLS);
   const cellH = out.height - PAD*2 - TOP_BANNER;
 
-  // Load BodyPix once
-  const net = await bodyPix.load({ architecture: 'MobileNetV1', outputStride: 16, multiplier: 0.75, quantBytes: 2 });
+  // Load BodyPix
+  const net = await bodyPix.load({
+    architecture: 'MobileNetV1',
+    outputStride: 16,
+    multiplier: 0.75,
+    quantBytes: 2
+  });
 
   function loadImage(file){
     return new Promise((resolve, reject) => {
@@ -80,44 +88,26 @@
     });
   }
 
-  function getBoundingBoxFromMask(mask, width, height){
-    // mask is a Uint8ClampedArray RGBA returned from toMask OR boolean array from segmentation.data
+  function getBoundingBoxFromMask(maskRGBA, width, height){
+    // maskRGBA = Uint8ClampedArray of RGBA; keep pixels with alpha > 0
     let top = height, left = width, right = 0, bottom = 0;
     let found = false;
 
-    // If mask is boolean array (segmentation.data)
-    if (mask instanceof Uint8Array || mask instanceof Uint8ClampedArray){
-      // Assume RGBA, keep non‑transparent pixels
-      for(let y=0, i=0; y<height; y++){
-        for(let x=0; x<width; x++, i+=4){
-          const a = mask[i+3];
-          if (a > 0){
-            found = true;
-            if (x < left) left = x;
-            if (x > right) right = x;
-            if (y < top) top = y;
-            if (y > bottom) bottom = y;
-          }
-        }
-      }
-    } else {
-      // boolean array from segmentation
-      for(let y=0, i=0; y<height; y++){
-        for(let x=0; x<width; x++, i++){
-          if (mask[i]){
-            found = true;
-            if (x < left) left = x;
-            if (x > right) right = x;
-            if (y < top) top = y;
-            if (y > bottom) bottom = y;
-          }
+    for(let y=0, i=0; y<height; y++){
+      for(let x=0; x<width; x++, i+=4){
+        const a = maskRGBA[i+3];
+        if (a > 0){
+          found = true;
+          if (x < left) left = x;
+          if (x > right) right = x;
+          if (y < top) top = y;
+          if (y > bottom) bottom = y;
         }
       }
     }
-
     if (!found) return null;
 
-    // add a little breathing room
+    // add breathing room
     const margin = 18;
     left = Math.max(0, left - margin);
     top = Math.max(0, top - margin);
@@ -128,7 +118,7 @@
   }
 
   async function segmentAndCrop(img){
-    // Draw image to a temp canvas at a manageable size (speed/quality tradeoff)
+    // Downscale for speed
     const maxSide = 900;
     const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
     const w = Math.round(img.width * scale);
@@ -139,44 +129,46 @@
     const tctx = temp.getContext('2d');
     tctx.drawImage(img, 0, 0, w, h);
 
-    // Person segmentation
+    // Person segmentation (slightly lower threshold to keep thin limbs)
     const segmentation = await net.segmentPerson(temp, {
-      internalResolution: 'medium', // 'low'|'medium'|'high'
-      segmentationThreshold: 0.7,
+      internalResolution: 'high',
+      segmentationThreshold: 0.6
     });
 
-    // Convert to an RGBA mask we can trim by
-    const fg = { r: 0, g: 0, b: 0, a: 0 };
-    const bg = { r: 0, g: 0, b: 0, a: 0 };
-    const mask = bodyPix.toMask(segmentation, fg, bg, true); // person = opaque white, background = transparent
+    // FILLED mask (the previous issue was contour-only)
+    const fg = { r: 255, g: 255, b: 255, a: 255 }; // opaque foreground
+    const bg = { r: 0, g: 0, b: 0, a: 0 };         // transparent background
+    const mask = bodyPix.toMask(segmentation, fg, bg, /*drawContour=*/false);
 
-    // Find bounding box of the opaque area
+    // Measure subject bounds
     const box = getBoundingBoxFromMask(mask.data, mask.width, mask.height);
 
-    // If no person found, fall back to centered crop
-    const fallback = !box ? { x: Math.max(0, (w - Math.min(w,h))/2), y: Math.max(0, (h - Math.min(w,h))/2), w: Math.min(w,h), h: Math.min(w,h) } : box;
+    // Fallback smart center crop if mask failed
+    const fallback = !box
+      ? { x: Math.max(0, (w - Math.min(w,h))/2), y: Math.max(0, (h - Math.min(w,h))/2), w: Math.min(w,h), h: Math.min(w,h) }
+      : box;
 
     // Create a masked, trimmed canvas
     const outC = document.createElement('canvas');
     outC.width = fallback.w; outC.height = fallback.h;
     const octx = outC.getContext('2d');
 
-    // Paint masked image
-    octx.save();
-    // Use the mask alpha to clip drawing
+    // Put mask RGBA into a canvas
     const maskCanvas = document.createElement('canvas');
     maskCanvas.width = mask.width; maskCanvas.height = mask.height;
     const mctx = maskCanvas.getContext('2d');
     const mimg = new ImageData(mask.data, mask.width, mask.height);
     mctx.putImageData(mimg, 0, 0);
 
-    // Draw mask portion
+    // Draw trimmed masked region
+    octx.save();
     octx.drawImage(maskCanvas, fallback.x, fallback.y, fallback.w, fallback.h, 0, 0, fallback.w, fallback.h);
     octx.globalCompositeOperation = 'source-in';
-    octx.drawImage(temp, fallback.x, fallback.y, fallback.w, fallback.h, 0, 0, fallback.w, fallback.h);
+    octx.drawImage(temp,       fallback.x, fallback.y, fallback.w, fallback.h, 0, 0, fallback.w, fallback.h);
     octx.restore();
 
-    return outC; // returns a trimmed, masked person crop
+    // Return both the trimmed person and their raw height for normalization
+    return { canvas: outC, personHeight: fallback.h };
   }
 
   function placeLabeled(context, x, y, w, h, label){
@@ -207,30 +199,44 @@
 
     const labels = ['FRONT', 'SIDE', 'BACK'];
 
-    for (let i=0; i<3; i++){
-      const img = await loadImage(files[i]);
-      const trimmed = await segmentAndCrop(img);
+    // Segment all three first so we can normalize scale by person height
+    const loaded = await Promise.all(files.map(loadImage));
+    const trimmed = await Promise.all(loaded.map(segmentAndCrop));
 
-      // Place column area
+    // Compute a common target "person height" so the three columns look consistent
+    const usableH = cellH - 40;      // below the label
+    const targetH = usableH - 24;    // bottom padding
+    const medianHeight = trimmed.map(t => t.personHeight).sort((a,b)=>a-b)[1]; // simple median of 3
+
+    for (let i=0; i<3; i++){
+      const { canvas: personCanvas, personHeight } = trimmed[i];
+
+      // Column rect
       const x = PAD + i * (cellW + GAP);
       const y = PAD;
       placeLabeled(ctx, x, y, cellW, cellH, labels[i]);
 
-      // Fit the trimmed person into the cell area below the banner
-      const usableH = cellH - 40; // minus some top space under the word
-      const targetW = cellW - 24; // side padding
-      const targetH = usableH - 24; // bottom padding
-      const scale = Math.min(targetW / trimmed.width, targetH / trimmed.height);
-      const drawW = Math.round(trimmed.width * scale);
-      const drawH = Math.round(trimmed.height * scale);
+      // Normalize scale so heights match across columns (but still respect cell bounds)
+      const normScale = targetH / medianHeight;
+      let drawW = Math.round(personCanvas.width  * normScale);
+      let drawH = Math.round(personCanvas.height * normScale);
+
+      // Ensure we still fit in width
+      const maxW = cellW - 24; // side padding
+      if (drawW > maxW){
+        const s = maxW / drawW;
+        drawW = Math.round(drawW * s);
+        drawH = Math.round(drawH * s);
+      }
+
       const dx = x + (cellW - drawW)/2;
       const dy = y + 40 + (usableH - drawH)/2;
 
       ctx.save();
-      // Soft drop shadow for legibility
+      // Soft shadow for legibility
       ctx.shadowColor = 'rgba(0,0,0,0.14)';
       ctx.shadowBlur = 14; ctx.shadowOffsetY = 6;
-      ctx.drawImage(trimmed, dx, dy, drawW, drawH);
+      ctx.drawImage(personCanvas, dx, dy, drawW, drawH);
       ctx.restore();
     }
   }
