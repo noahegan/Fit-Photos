@@ -22,7 +22,7 @@
     small.mono { font-family: ui-monospace, Menlo, Consolas, monospace; color:#6b7280; }
     .error { background:#fff3f3; color:#7a0000; border:1px solid #f0b8b8; padding:10px 12px; border-radius:10px; display:none; margin-bottom:12px; }
   </style>
-  <!-- Runs fully in the browser -->
+  <!-- Fully client‑side -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.0"></script>
 </head>
@@ -30,7 +30,7 @@
   <div class="app">
     <h1>Free 3‑Photo Fit Board</h1>
     <div id="err" class="error"></div>
-    <p>Upload <b>Front</b>, <b>Side</b>, and <b>Back</b> photos. The tool takes a <b>rectangular crop</b> with consistent framing: includes arms, light head trim, fixed bottom padding, and the same zoom across columns.</p>
+    <p>Upload <b>Front</b>, <b>Side</b>, and <b>Back</b> photos. The tool takes a <b>rectangular crop</b> with consistent framing across columns (same zoom, same top/bottom lines), keeps arms, trims just a bit above the neck (equal for all), and adds fixed bottom padding.</p>
 
     <div class="grid">
       <div class="card"><label>Front</label><input id="front" type="file" accept="image/*" /></div>
@@ -62,21 +62,18 @@
   const ctx = out.getContext('2d');
   const errBox = document.getElementById('err');
 
-  function showErr(msg){
-    errBox.textContent = msg;
-    errBox.style.display = 'block';
-  }
-  function clearErr(){ errBox.style.display = 'none'; errBox.textContent=''; }
+  function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
+  function clearErr(){ errBox.textContent = ''; errBox.style.display = 'none'; }
 
-  // Layout constants
+  // Layout
   const PAD = 28, GAP = 16, COLS = 3, TOP_BANNER = 80;
   const cellW = Math.floor((out.width - PAD*2 - GAP*(COLS-1)) / COLS);
   const cellH = out.height - PAD*2 - TOP_BANNER;
 
-  // Framing rules (tweak here)
-  const SIDE_PAD_PCT  = 0.14; // keep arms (each side = 14% of bbox width)
-  const HEAD_TRIM_PCT = 0.05; // trim above bbox top to avoid chin/face (gentle)
-  const BOTTOM_PAD_PX = 60;   // fixed extra space below lowest pixel
+  // Framing constants (applied equally to all views)
+  const SIDE_PAD_PCT  = 0.14; // widen the bbox to keep arms (each side = 14% of bbox width)
+  const HEAD_TRIM_PCT = 0.03; // light trim above bbox top to avoid chin/face (more neck shown)
+  const BOTTOM_PAD_PX = 60;   // fixed extra space below the lowest foreground pixel
 
   // Load BodyPix
   let net;
@@ -88,9 +85,8 @@
       quantBytes: 2
     });
   } catch (e) {
-    showErr('Failed to load BodyPix model. Check your internet connection and refresh the page.');
-    console.error(e);
-    return;
+    showErr('Failed to load BodyPix. Check your connection and refresh.');
+    console.error(e); return;
   }
 
   function loadImage(file){
@@ -120,61 +116,49 @@
     return { x:left, y:top, w:(right-left+1), h:(bottom-top+1), bottom };
   }
 
-  // Measure a smart rectangle using overall person segmentation
+  // Measure a smart rectangular crop from person segmentation
   async function measureRect(img){
-    try{
-      // Work at reduced scale for speed; we crop from this scaled canvas
-      const maxSide = 1200;
-      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
-      const w = Math.round(img.width * scale);
-      const h = Math.round(img.height * scale);
+    const maxSide = 1200;
+    const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+    const w = Math.round(img.width * scale);
+    const h = Math.round(img.height * scale);
 
-      const temp = document.createElement('canvas');
-      temp.width = w; temp.height = h;
-      const tctx = temp.getContext('2d');
-      tctx.drawImage(img, 0, 0, w, h);
+    const temp = document.createElement('canvas');
+    temp.width = w; temp.height = h;
+    const tctx = temp.getContext('2d');
+    tctx.drawImage(img, 0, 0, w, h);
 
-      // Person segmentation just to get a mask/bbox
-      const seg = await net.segmentPerson(temp, {
-        internalResolution: 'high',
-        segmentationThreshold: 0.6
-      });
-      const mask = bodyPix.toMask(seg, {r:255,g:255,b:255,a:255}, {r:0,g:0,b:0,a:0}, false);
-      const box = bboxFromMaskAlpha(mask.data, mask.width, mask.height);
+    const seg = await net.segmentPerson(temp, {
+      internalResolution: 'high',
+      segmentationThreshold: 0.6
+    });
+    const mask = bodyPix.toMask(seg, {r:255,g:255,b:255,a:255}, {r:0,g:0,b:0,a:0}, false);
+    const box = bboxFromMaskAlpha(mask.data, mask.width, mask.height);
 
-      // Fallback if no person found
-      if (!box){
-        const s = Math.min(w,h);
-        const rect = { x: Math.floor((w-s)/2), y: Math.floor((h-s)/2), w:s, h:s };
-        return { temp, rect, anchorHeight: s };
-      }
-
-      // Expand horizontally to keep arms
-      const sidePad = Math.round(box.w * SIDE_PAD_PCT);
-      let x  = Math.max(0, box.x - sidePad);
-      let rw = Math.min(w - x, box.w + sidePad*2);
-
-      // Gentle head trim to avoid face
-      const headTrim = Math.round(box.h * HEAD_TRIM_PCT);
-      let y  = Math.max(0, box.y + headTrim);
-
-      // Fixed bottom pad from the lowest foreground pixel
-      const yBottomDesired = Math.min(h-1, box.bottom + BOTTOM_PAD_PX);
-      let rh = Math.min(h - y, yBottomDesired - y);
-
-      // Clamp to canvas
-      if (x + rw > w) rw = w - x;
-      if (y + rh > h) rh = h - y;
-
-      // Anchor height (top of bbox before trim -> bottom+pad) for consistent zoom
-      const anchorHeight = (yBottomDesired - box.y);
-
-      return { temp, rect: { x, y, w: rw, h: rh }, anchorHeight };
-    } catch (e) {
-      showErr('Error while analyzing a photo. Try different images or refresh.');
-      console.error(e);
-      throw e;
+    // Fallback if no person detected
+    if (!box){
+      const s = Math.min(w,h);
+      return { temp, rect: { x:(w-s)/2, y:(h-s)/2, w:s, h:s } };
     }
+
+    // Horizontal padding for arms
+    const sidePad = Math.round(box.w * SIDE_PAD_PCT);
+    let x  = Math.max(0, box.x - sidePad);
+    let rw = Math.min(w - x, box.w + sidePad*2);
+
+    // Light trim above neck (equal for all)
+    const headTrim = Math.round(box.h * HEAD_TRIM_PCT);
+    let y  = Math.max(0, box.y + headTrim);
+
+    // Fixed bottom padding
+    const yBottomDesired = Math.min(h-1, box.bottom + BOTTOM_PAD_PX);
+    let rh = Math.min(h - y, yBottomDesired - y);
+
+    // Clamp
+    if (x + rw > w) rw = w - x;
+    if (y + rh > h) rh = h - y;
+
+    return { temp, rect: { x, y, w: rw, h: rh } };
   }
 
   function placeLabel(context, x, y, w, h, label){
@@ -189,29 +173,40 @@
     context.restore();
   }
 
+  // NEW build(): force identical draw heights so tops & bottoms align exactly
   async function build(){
     clearErr();
     const files = [input.front.files[0], input.side.files[0], input.back.files[0]];
     if (!files.every(Boolean)) { showErr('Please select all three photos.'); return; }
 
-    // White background
+    // Background
     ctx.fillStyle = '#fff';
     ctx.fillRect(0,0,out.width,out.height);
 
     const labels = ['FRONT','SIDE','BACK'];
 
-    // Measure all 3 first so zoom can be normalized by anchor height
     let imgs, measures;
-    try{
+    try {
       imgs = await Promise.all(files.map(loadImage));
       measures = await Promise.all(imgs.map(measureRect));
-    } catch { return; }
+    } catch (e) {
+      showErr('Error analyzing one of the photos. Try again or refresh.');
+      console.error(e); return;
+    }
 
-    // Normalize zoom: use median anchor height (top→bottom+pad)
-    const usableH = cellH - 40;
+    const usableH = cellH - 40;  // under label
     const targetH = usableH - 24;
-    const anchors = measures.map(m => m.anchorHeight).sort((a,b)=>a-b);
-    const commonAnchor = anchors[1]; // median
+    const maxW    = cellW - 24;  // side padding
+
+    // Compute, for each image, the tallest we can draw without exceeding width or target height
+    const perImageMaxHeights = measures.map(({rect}) => {
+      const heightByTarget = targetH;
+      const heightByWidth  = rect.h * (maxW / rect.w); // if width limited, height must shrink
+      return Math.min(heightByTarget, heightByWidth);
+    });
+
+    // Use the minimum of those so all three can share the same draw height
+    const globalDrawH = Math.floor(Math.min(...perImageMaxHeights));
 
     for (let i=0; i<3; i++){
       const { temp, rect } = measures[i];
@@ -220,16 +215,10 @@
       const y = PAD;
       placeLabel(ctx, x, y, cellW, cellH, labels[i]);
 
-      const scale = targetH / commonAnchor;
-      let drawW = Math.round(rect.w * scale);
-      let drawH = Math.round(rect.h * scale);
-
-      const maxW = cellW - 24; // respect side padding
-      if (drawW > maxW){
-        const s = maxW / drawW;
-        drawW = Math.round(drawW * s);
-        drawH = Math.round(drawH * s);
-      }
+      // Scale to identical height across columns
+      const scale = globalDrawH / rect.h;
+      const drawH = globalDrawH;
+      const drawW = Math.round(rect.w * scale);
 
       const dx = x + (cellW - drawW)/2;
       const dy = y + 40 + (usableH - drawH)/2;
