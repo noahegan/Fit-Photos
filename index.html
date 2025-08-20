@@ -1,3 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Free 3-Photo Fit Board</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; background:#f6f7fb; color:#111; }
+    h1 { margin: 0 0 8px; }
+    .app { max-width: 980px; margin: 0 auto; background:#fff; border-radius: 16px;
+           box-shadow: 0 6px 24px rgba(0,0,0,.08); padding: 20px; }
+    .grid { display:grid; grid-template-columns: 1fr; gap:16px; }
+    @media(min-width:780px){ .grid{ grid-template-columns: repeat(3, 1fr);} }
+    .card { background:#fafbff; border:1px solid #e7e9f3; border-radius:12px; padding:14px; }
+    label { font-weight: 600; font-size: 14px; display:block; margin-bottom:8px; }
+    input[type="file"] { width:100%; padding:10px; border:1px dashed #cdd2e2; border-radius:10px; background:#fff; }
+    button { cursor:pointer; border:0; background:#111; color:#fff; padding:12px 16px; border-radius:12px; font-weight:700; }
+    button.secondary { background:#fff; color:#111; border:1px solid #d0d5e7; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    canvas { width:100%; max-width:100%; background:#fff; border-radius:12px; border:1px solid #e7e9f3; }
+    small.mono { font-family: monospace; color:#6b7280; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.0"></script>
+</head>
+<body>
+  <div class="app">
+    <h1>Free 3-Photo Fit Board</h1>
+    <p>Upload <b>Front</b>, <b>Side</b>, and <b>Back</b> photos. This page will take a <b>rectangle crop</b> (not a cut-out) with consistent framing.</p>
+
+    <div class="grid">
+      <div class="card"><label>Front</label><input id="front" type="file" accept="image/*" /></div>
+      <div class="card"><label>Side</label><input id="side" type="file" accept="image/*" /></div>
+      <div class="card"><label>Back</label><input id="back" type="file" accept="image/*" /></div>
+    </div>
+
+    <div style="height:12px"></div>
+    <div class="row">
+      <button id="build">Build Layout</button>
+      <button id="download" class="secondary">Download PNG</button>
+      <small class="mono">Everything runs on-device. No uploads.</small>
+    </div>
+
+    <div style="height:12px"></div>
+    <canvas id="output" width="1500" height="850"></canvas>
+  </div>
+
 <script>
 (async function(){
   const fileInputs = {
@@ -15,15 +62,12 @@
   const cellW = Math.floor((out.width - PAD*2 - GAP*(COLS-1)) / COLS);
   const cellH = out.height - PAD*2 - TOP_BANNER;
 
-  // Crop rules (tweak as you like)
-  const SIDE_PAD_PCT   = 0.12;  // widen to keep arms (12% of bbox width each side)
-  const HEAD_TRIM_PCT  = 0.10;  // remove top 10% of bbox to avoid face
-  const BOTTOM_PAD_PX  = 40;    // fixed extra space below lowest pixel
+  // Crop rules
+  const SIDE_PAD_PCT   = 0.12;
+  const HEAD_TRIM_PCT  = 0.10;
+  const BOTTOM_PAD_PX  = 40;
 
-  // Load BodyPix (browser-only)
-  const net = await bodyPix.load({
-    architecture: 'MobileNetV1', outputStride: 16, multiplier: 0.75, quantBytes: 2
-  });
+  const net = await bodyPix.load({ architecture: 'MobileNetV1', outputStride: 16, multiplier: 0.75, quantBytes: 2 });
 
   function loadImage(file){
     return new Promise((resolve, reject) => {
@@ -35,11 +79,11 @@
     });
   }
 
-  function bboxFromMaskAlpha(alphaRGBA, w, h){
+  function bboxFromMaskAlpha(rgba, w, h){
     let top=h, left=w, right=0, bottom=0, found=false;
     for (let y=0, i=0; y<h; y++){
       for (let x=0; x<w; x++, i+=4){
-        if (alphaRGBA[i+3] > 0){
+        if (rgba[i+3] > 0){
           found = true;
           if (x<left) left=x;
           if (x>right) right=x;
@@ -53,7 +97,6 @@
   }
 
   async function measureRect(img){
-    // Work on a scaled copy for speed; we’ll crop from this same scaled canvas
     const maxSide = 1000;
     const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
     const w = Math.round(img.width * scale);
@@ -64,42 +107,23 @@
     const tctx = temp.getContext('2d');
     tctx.drawImage(img, 0, 0, w, h);
 
-    // Person segmentation to get a mask for bbox only
     const seg = await net.segmentPerson(temp, { internalResolution: 'high', segmentationThreshold: 0.6 });
-    const fg = { r: 255, g: 255, b: 255, a: 255 }, bg = { r:0, g:0, b:0, a:0 };
-    const mask = bodyPix.toMask(seg, fg, bg, false); // filled mask
+    const mask = bodyPix.toMask(seg, {r:255,g:255,b:255,a:255}, {r:0,g:0,b:0,a:0}, false);
     const box = bboxFromMaskAlpha(mask.data, mask.width, mask.height);
 
-    // If segmentation fails, fallback to center crop
     let rect;
     if (!box){
       const s = Math.min(w,h);
-      rect = { x: Math.floor((w-s)/2), y: Math.floor((h-s)/2), w:s, h:s, bottom: Math.floor((h+s)/2) };
+      rect = { x:(w-s)/2, y:(h-s)/2, w:s, h:s, bottom:h };
     } else {
-      // Expand horizontally to keep arms
       const sidePad = Math.round(box.w * SIDE_PAD_PCT);
       let x = Math.max(0, box.x - sidePad);
-      let y = box.y;
+      let y = box.y + Math.round(box.h * HEAD_TRIM_PCT);
       let rw = Math.min(w - x, box.w + sidePad*2);
-      let rh = box.h;
-
-      // Trim head (hide face)
-      const headTrim = Math.round(rh * HEAD_TRIM_PCT);
-      y += headTrim;
-      rh -= headTrim;
-
-      // Ensure consistent bottom padding
-      const desiredBottom = Math.min(h-1, box.bottom + BOTTOM_PAD_PX);
-      rh = Math.min(h - y, desiredBottom - y);
-
-      // Ensure rectangle stays on-canvas
-      if (x + rw > w) rw = w - x;
-      if (y + rh > h) rh = h - y;
-
-      rect = { x, y, w: rw, h: rh, bottom: desiredBottom };
+      let rh = Math.min(h - y, (box.bottom + BOTTOM_PAD_PX) - y);
+      rect = { x, y, w:rw, h:rh, bottom: box.bottom + BOTTOM_PAD_PX };
     }
-
-    return { temp, rect }; // crop from temp using rect
+    return { temp, rect };
   }
 
   function placeLabel(context, x, y, w, h, label){
@@ -107,7 +131,7 @@
     context.fillStyle = '#fff';
     context.fillRect(x, y, w, h + TOP_BANNER);
     context.fillStyle = '#111';
-    context.font = 'bold 40px Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+    context.font = 'bold 40px system-ui, sans-serif';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
     context.fillText(label, x + w/2, y + 24);
@@ -116,28 +140,22 @@
 
   async function build(){
     const files = [fileInputs.front.files[0], fileInputs.side.files[0], fileInputs.back.files[0]];
-    if (!files.every(Boolean)) { alert('Please select all three photos.'); return; }
+    if (!files.every(Boolean)) { alert('Select all three photos.'); return; }
 
-    // Clear board
-    ctx.clearRect(0,0,out.width,out.height);
     ctx.fillStyle = '#fff';
     ctx.fillRect(0,0,out.width,out.height);
 
     const labels = ['FRONT','SIDE','BACK'];
-
-    // Load + measure all 3 first so we can normalize scale
     const imgs = await Promise.all(files.map(loadImage));
     const measures = await Promise.all(imgs.map(measureRect));
 
-    // Normalize zoom by the rectangle height (median to avoid outliers)
     const usableH = cellH - 40;
     const targetH = usableH - 24;
     const rectHeights = measures.map(m => m.rect.h).sort((a,b)=>a-b);
-    const commonH = rectHeights[1]; // median
+    const commonH = rectHeights[1];
 
     for (let i=0; i<3; i++){
       const { temp, rect } = measures[i];
-
       const x = PAD + i * (cellW + GAP);
       const y = PAD;
       placeLabel(ctx, x, y, cellW, cellH, labels[i]);
@@ -145,34 +163,27 @@
       const scale = targetH / commonH;
       let drawW = Math.round(rect.w * scale);
       let drawH = Math.round(rect.h * scale);
-
-      // Fit within width if needed
-      const maxW = cellW - 24;
-      if (drawW > maxW){
-        const s = maxW / drawW;
+      if (drawW > cellW-24){
+        const s = (cellW-24)/drawW;
         drawW = Math.round(drawW * s);
         drawH = Math.round(drawH * s);
       }
-
       const dx = x + (cellW - drawW)/2;
       const dy = y + 40 + (usableH - drawH)/2;
 
-      // Draw the rectangular crop directly from the scaled photo
-      ctx.save();
-      ctx.shadowColor = 'rgba(0,0,0,0.10)';
-      ctx.shadowBlur = 10; ctx.shadowOffsetY = 5;
       ctx.drawImage(temp, rect.x, rect.y, rect.w, rect.h, dx, dy, drawW, drawH);
-      ctx.restore();
     }
   }
 
-  buildBtn.addEventListener('click', () => build());
+  buildBtn.addEventListener('click', build);
   dlBtn.addEventListener('click', () => {
     const url = out.toDataURL('image/png');
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'fit-board-front-side-back.png';
+    a.download = 'fit-board.png';
     a.click();
   });
 })();
 </script>
+</body>
+</html>
