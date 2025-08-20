@@ -10,18 +10,19 @@
   const out = document.getElementById('output');
   const ctx = out.getContext('2d');
 
-  // Board layout constants
-  const PAD = 28, GAP = 16, COLS = 3;
-  const TOP_BANNER = 80;
+  // Layout
+  const PAD = 28, GAP = 16, COLS = 3, TOP_BANNER = 80;
   const cellW = Math.floor((out.width - PAD*2 - GAP*(COLS-1)) / COLS);
   const cellH = out.height - PAD*2 - TOP_BANNER;
 
-  // ---- Load BodyPix once
+  // Crop rules (tweak as you like)
+  const SIDE_PAD_PCT   = 0.12;  // widen to keep arms (12% of bbox width each side)
+  const HEAD_TRIM_PCT  = 0.10;  // remove top 10% of bbox to avoid face
+  const BOTTOM_PAD_PX  = 40;    // fixed extra space below lowest pixel
+
+  // Load BodyPix (browser-only)
   const net = await bodyPix.load({
-    architecture: 'MobileNetV1',
-    outputStride: 16,
-    multiplier: 0.75,
-    quantBytes: 2
+    architecture: 'MobileNetV1', outputStride: 16, multiplier: 0.75, quantBytes: 2
   });
 
   function loadImage(file){
@@ -34,82 +35,12 @@
     });
   }
 
-  // Build a filled, face-removed mask from part segmentation
-  function buildMaskFromParts(partSeg, w, h) {
-    // Parts we want to keep (include arms, torso, legs, hands, feet)
-    // We exclude face/head parts so no faces show.
-    const KEEP = new Set([
-      'leftUpperArm','rightUpperArm','leftLowerArm','rightLowerArm',
-      'leftHand','rightHand',
-      'torso',
-      'leftUpperLeg','rightUpperLeg','leftLowerLeg','rightLowerLeg',
-      'leftFoot','rightFoot'
-    ]);
-
-    // Map each pixel to keep/discard
-    const keepBool = new Uint8Array(w*h);
-    for (let i=0; i<partSeg.data.length; i++) {
-      const p = partSeg.allPoses[0].partIds[ partSeg.data[i] ] || null;
-      const partName = partSeg.partNames[ partSeg.data[i] ] || null;
-      if (partName && KEEP.has(partName)) keepBool[i] = 1;
-    }
-
-    // Convert to RGBA alpha mask (filled)
-    const rgba = new Uint8ClampedArray(w*h*4);
-    for (let i=0, j=0; i<w*h; i++, j+=4) {
-      const a = keepBool[i] ? 255 : 0;
-      rgba[j] = 255; rgba[j+1] = 255; rgba[j+2] = 255; rgba[j+3] = a;
-    }
-    return rgba;
-  }
-
-  // Simple blur + threshold on the alpha channel to close small holes / keep arms
-  function refineAlpha(rgba, w, h) {
-    // Extract alpha
-    const alpha = new Uint8ClampedArray(w*h);
-    for (let i=0, j=0; i<w*h; i++, j+=4) alpha[i] = rgba[j+3];
-
-    // Box blur (radius 2)
-    const r = 2;
-    const tmp = new Uint16Array(w*h);
-    // horizontal
-    for (let y=0; y<h; y++){
-      let sum=0;
-      for (let x=0; x<w; x++){
-        const add = alpha[y*w + Math.min(w-1, x+r)];
-        const sub = alpha[y*w + Math.max(0, x-r-1)];
-        sum += add - sub;
-        tmp[y*w + x] = sum;
-      }
-    }
-    // vertical
-    const outA = new Uint8ClampedArray(w*h);
-    const span = (2*r+1)*(2*r+1);
-    for (let x=0; x<w; x++){
-      let sum=0;
-      for (let y=0; y<h; y++){
-        const add = tmp[Math.min(h-1, y+r)*w + x];
-        const sub = tmp[Math.max(0, y-r-1)*w + x];
-        sum += add - sub;
-        outA[y*w + x] = Math.round(sum / span);
-      }
-    }
-
-    // Threshold to solid mask
-    const THRESH = 40; // lower -> keep more; higher -> tighter
-    for (let i=0, j=0; i<w*h; i++, j+=4){
-      const a = outA[i] > THRESH ? 255 : 0;
-      rgba[j] = 255; rgba[j+1] = 255; rgba[j+2] = 255; rgba[j+3] = a;
-    }
-    return rgba;
-  }
-
-  function bboxFromAlpha(rgba, w, h) {
+  function bboxFromMaskAlpha(alphaRGBA, w, h){
     let top=h, left=w, right=0, bottom=0, found=false;
     for (let y=0, i=0; y<h; y++){
       for (let x=0; x<w; x++, i+=4){
-        if (rgba[i+3] > 0){
-          found=true;
+        if (alphaRGBA[i+3] > 0){
+          found = true;
           if (x<left) left=x;
           if (x>right) right=x;
           if (y<top) top=y;
@@ -121,8 +52,8 @@
     return { x:left, y:top, w:(right-left+1), h:(bottom-top+1), bottom };
   }
 
-  async function segmentAndCrop(img){
-    // Downscale for speed
+  async function measureRect(img){
+    // Work on a scaled copy for speed; we’ll crop from this same scaled canvas
     const maxSide = 1000;
     const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
     const w = Math.round(img.width * scale);
@@ -133,66 +64,45 @@
     const tctx = temp.getContext('2d');
     tctx.drawImage(img, 0, 0, w, h);
 
-    // ---- Part segmentation (keeps arms; lets us drop the face)
-    const parts = await net.segmentPersonParts(temp, {
-      internalResolution: 'high',
-      segmentationThreshold: 0.6
-    });
+    // Person segmentation to get a mask for bbox only
+    const seg = await net.segmentPerson(temp, { internalResolution: 'high', segmentationThreshold: 0.6 });
+    const fg = { r: 255, g: 255, b: 255, a: 255 }, bg = { r:0, g:0, b:0, a:0 };
+    const mask = bodyPix.toMask(seg, fg, bg, false); // filled mask
+    const box = bboxFromMaskAlpha(mask.data, mask.width, mask.height);
 
-    // Build + refine mask
-    let maskRGBA = buildMaskFromParts(parts, w, h);
-    maskRGBA = refineAlpha(maskRGBA, w, h);
+    // If segmentation fails, fallback to center crop
+    let rect;
+    if (!box){
+      const s = Math.min(w,h);
+      rect = { x: Math.floor((w-s)/2), y: Math.floor((h-s)/2), w:s, h:s, bottom: Math.floor((h+s)/2) };
+    } else {
+      // Expand horizontally to keep arms
+      const sidePad = Math.round(box.w * SIDE_PAD_PCT);
+      let x = Math.max(0, box.x - sidePad);
+      let y = box.y;
+      let rw = Math.min(w - x, box.w + sidePad*2);
+      let rh = box.h;
 
-    // Bounding box of subject (after refinement)
-    const box0 = bboxFromAlpha(maskRGBA, w, h);
+      // Trim head (hide face)
+      const headTrim = Math.round(rh * HEAD_TRIM_PCT);
+      y += headTrim;
+      rh -= headTrim;
 
-    // If no mask found, fallback to a centered square crop
-    const fallback = !box0
-      ? { x: Math.max(0, (w - Math.min(w,h))/2), y: Math.max(0, (h - Math.min(w,h))/2),
-          w: Math.min(w,h), h: Math.min(w,h), bottom: Math.min(w,h) }
-      : box0;
+      // Ensure consistent bottom padding
+      const desiredBottom = Math.min(h-1, box.bottom + BOTTOM_PAD_PX);
+      rh = Math.min(h - y, desiredBottom - y);
 
-    // Consistent crop rules:
-    //  - Remove head: raise top to roughly shoulder level by trimming 10% of height from top
-    //  - Keep arms: expand width margin
-    //  - Ensure constant bottom padding relative to outfit: add 40px below lowest pixel (clamped)
-    const MARGIN_X = 24;
-    const HEAD_TRIM = Math.round(fallback.h * 0.10);
-    const BOTTOM_PAD = 40;
+      // Ensure rectangle stays on-canvas
+      if (x + rw > w) rw = w - x;
+      if (y + rh > h) rh = h - y;
 
-    let cx = Math.max(0, fallback.x - MARGIN_X);
-    let cy = Math.max(0, fallback.y + HEAD_TRIM);
-    let cw = Math.min(w - cx, fallback.w + MARGIN_X*2);
-    // bottom is the lowest alpha pixel row; extend by padding
-    let desiredBottom = Math.min(h-1, fallback.bottom + BOTTOM_PAD);
-    let ch = Math.min(h - cy, desiredBottom - cy);
+      rect = { x, y, w: rw, h: rh, bottom: desiredBottom };
+    }
 
-    // Prepare canvases
-    const personC = document.createElement('canvas');
-    personC.width = cw; personC.height = ch;
-    const pctx = personC.getContext('2d');
-
-    // Create a canvas for the refined mask
-    const maskCanvas = document.createElement('canvas');
-    maskCanvas.width = w; maskCanvas.height = h;
-    const mctx = maskCanvas.getContext('2d');
-    const mimg = new ImageData(maskRGBA, w, h);
-    mctx.putImageData(mimg, 0, 0);
-
-    // Composite: white background, then clip to mask area
-    pctx.save();
-    pctx.fillStyle = '#fff';
-    pctx.fillRect(0,0,cw,ch);
-    pctx.drawImage(maskCanvas, cx, cy, cw, ch, 0, 0, cw, ch);
-    pctx.globalCompositeOperation = 'source-in';
-    pctx.drawImage(temp, cx, cy, cw, ch, 0, 0, cw, ch);
-    pctx.restore();
-
-    // Return crop + the subject crop height (used for normalization)
-    return { canvas: personC, subjectHeight: ch };
+    return { temp, rect }; // crop from temp using rect
   }
 
-  function placeLabeled(context, x, y, w, h, label){
+  function placeLabel(context, x, y, w, h, label){
     context.save();
     context.fillStyle = '#fff';
     context.fillRect(x, y, w, h + TOP_BANNER);
@@ -206,41 +116,39 @@
 
   async function build(){
     const files = [fileInputs.front.files[0], fileInputs.side.files[0], fileInputs.back.files[0]];
-    if (!files.every(Boolean)) { alert('Please select all three photos (Front, Side, Back).'); return; }
+    if (!files.every(Boolean)) { alert('Please select all three photos.'); return; }
 
     // Clear board
     ctx.clearRect(0,0,out.width,out.height);
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = '#fff';
     ctx.fillRect(0,0,out.width,out.height);
 
-    const labels = ['FRONT', 'SIDE', 'BACK'];
+    const labels = ['FRONT','SIDE','BACK'];
 
-    // Load & segment all three first (so we can normalize scale)
-    const loaded = await Promise.all(files.map(loadImage));
-    const crops = await Promise.all(loaded.map(segmentAndCrop));
+    // Load + measure all 3 first so we can normalize scale
+    const imgs = await Promise.all(files.map(loadImage));
+    const measures = await Promise.all(imgs.map(measureRect));
 
-    // Normalize zoom: make all three use the same subject height
-    const usableH = cellH - 40;      // area below labels
-    const targetH = usableH - 24;    // padding
-    const heights = crops.map(c => c.subjectHeight).sort((a,b)=>a-b);
-    const commonHeight = heights[1]; // median of 3
+    // Normalize zoom by the rectangle height (median to avoid outliers)
+    const usableH = cellH - 40;
+    const targetH = usableH - 24;
+    const rectHeights = measures.map(m => m.rect.h).sort((a,b)=>a-b);
+    const commonH = rectHeights[1]; // median
 
     for (let i=0; i<3; i++){
-      const { canvas: cut, subjectHeight } = crops[i];
+      const { temp, rect } = measures[i];
 
-      // Column area + label
       const x = PAD + i * (cellW + GAP);
       const y = PAD;
-      placeLabeled(ctx, x, y, cellW, cellH, labels[i]);
+      placeLabel(ctx, x, y, cellW, cellH, labels[i]);
 
-      // Scale so subject heights match across columns
-      const scale = targetH / commonHeight;
-      let drawW = Math.round(cut.width * scale);
-      let drawH = Math.round(cut.height * scale);
+      const scale = targetH / commonH;
+      let drawW = Math.round(rect.w * scale);
+      let drawH = Math.round(rect.h * scale);
 
-      // Respect max width
+      // Fit within width if needed
       const maxW = cellW - 24;
-      if (drawW > maxW) {
+      if (drawW > maxW){
         const s = maxW / drawW;
         drawW = Math.round(drawW * s);
         drawH = Math.round(drawH * s);
@@ -249,10 +157,11 @@
       const dx = x + (cellW - drawW)/2;
       const dy = y + 40 + (usableH - drawH)/2;
 
+      // Draw the rectangular crop directly from the scaled photo
       ctx.save();
-      ctx.shadowColor = 'rgba(0,0,0,0.12)';
-      ctx.shadowBlur = 12; ctx.shadowOffsetY = 6;
-      ctx.drawImage(cut, dx, dy, drawW, drawH);
+      ctx.shadowColor = 'rgba(0,0,0,0.10)';
+      ctx.shadowBlur = 10; ctx.shadowOffsetY = 5;
+      ctx.drawImage(temp, rect.x, rect.y, rect.w, rect.h, dx, dy, drawW, drawH);
       ctx.restore();
     }
   }
